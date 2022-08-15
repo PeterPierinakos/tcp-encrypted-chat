@@ -9,4 +9,6 @@ path = "src/bin/tec.rs"
 
 [dependencies]
 anyhow = "1.0.61"
+env_logger = "0.9.0"
 libaes = "0.6.2"
+log = "0.4.17"
