@@ -1,0 +1,12 @@
+[package]
+name = "tec"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "tec"
+path = "src/bin/tec.rs"
+
+[dependencies]
+anyhow = "1.0.61"
+libaes = "0.6.2"
