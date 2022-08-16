@@ -36,10 +36,22 @@ fn handle_input() -> anyhow::Result<()> {
         ))),
     };
 
+    println!("Enter encryption / decryption passphrase (must be exactly 32 characters long) (peer has to use the same one): ");
+    print!("> ");
+    io::stdout().flush()?;
+    let mut buffer_passphrase = String::new();
+    stdin.read_line(&mut buffer_passphrase)?;
+
+    let passphrase = buffer_passphrase.trim();
+
+    if passphrase.len() != 32 {
+        return Err(anyhow::Error::new(io::Error::new(io::ErrorKind::InvalidData, "Passphrase's length isn't 32.")));
+    }
+
     drop(stdin);
 
     log::info!("Input is OK, starting server...");
-    app::init(port, peer_addr)?;
+    app::init(port, peer_addr, passphrase)?;
 
     Ok(())
 }
