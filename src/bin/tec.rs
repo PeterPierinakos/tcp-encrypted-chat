@@ -1,7 +1,6 @@
 use std::io::{self, BufRead, Write};
+use std::collections::HashSet;
 use std::net::SocketAddr;
-
-
 use std::str::FromStr;
 use tec::app;
 
@@ -23,17 +22,22 @@ fn handle_input() -> anyhow::Result<()> {
         }
     };
 
-    println!("Enter peer socket address");
+    println!("Enter peer socket addresses (separate with commas if more than one)");
     print!("> ");
     io::stdout().flush()?;
     let mut buffer_addr = String::new();
     stdin.read_line(&mut buffer_addr)?;
-    let peer_addr = match SocketAddr::from_str(&buffer_addr.trim()) {
-        Ok(addr) => addr,
-        Err(_) => return Err(anyhow::Error::new(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "Invalid socket address given. Example of a valid socket address: \"127.0.0.1:5542\".",
-        ))),
+
+    let iter_addrs = buffer_addr.trim().split(",");
+
+    let mut peer_addrs = HashSet::new();
+
+    for addr in iter_addrs {
+        let peer_addr = match SocketAddr::from_str(addr) {
+            Ok(peer_addr) => peer_addr,
+            Err(_) => return Err(anyhow::Error::new(io::Error::new(io::ErrorKind::InvalidData, format!("Invalid socket address given ({addr}). Example of a valid socket address: \"127.0.0.1:5542\".")))),
+        };
+        peer_addrs.insert(peer_addr);
     };
 
     println!("Enter encryption / decryption passphrase (must be exactly 32 characters long) (peer has to use the same one)");
@@ -51,7 +55,7 @@ fn handle_input() -> anyhow::Result<()> {
     drop(stdin);
 
     log::info!("Input is OK, starting server...");
-    app::init(port, peer_addr, passphrase)?;
+    app::init(port, peer_addrs, passphrase)?;
 
     Ok(())
 }

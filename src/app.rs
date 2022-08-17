@@ -1,4 +1,7 @@
 use std::env;
+use std::sync::Arc;
+use std::net::IpAddr;
+use std::collections::HashSet;
 use std::time::Duration;
 use std::io::{self, BufRead, Read, Write};
 use std::net::SocketAddr;
@@ -7,6 +10,11 @@ use std::net::TcpStream;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
 use libaes::Cipher;
+
+pub struct Message {
+    pub peer: SocketAddr,
+    pub message: String,
+}
 
 // If the message written to the stream is bigger than the maximum buffer size, it will create a
 // new buffer as if it was a separate message.
@@ -46,7 +54,7 @@ pub fn parse_stringified_slice<'a>(msg: String) -> io::Result<Vec<u8>>
     for num in msg_splitted {
         let num = match num.parse::<u8>() {
             Ok(num) => num,
-            Err(_) => return Err(io::Error::new(io::ErrorKind::InvalidData, "Slice has an illegal character.")),
+            Err(_) => return Err(io::Error::new(io::ErrorKind::InvalidData, format!("Slice has an illegal character ({num})."))),
         };
 
         vec.push(num);
@@ -57,8 +65,8 @@ pub fn parse_stringified_slice<'a>(msg: String) -> io::Result<Vec<u8>>
 
 /// The main application's function. it is responsible for handling the TCP listener, the incoming
 /// streams and the sending user's messages.
-pub fn init(port: u16, peer_addr: SocketAddr, passphrase: &str) -> anyhow::Result<()> {
-    let (message_tx, message_rx): (Sender<String>, Receiver<String>) = mpsc::channel();
+pub fn init(port: u16, peer_addrs: HashSet<SocketAddr>, passphrase: &str) -> anyhow::Result<()> {
+    let (message_tx, message_rx): (Sender<Message>, Receiver<Message>) = mpsc::channel();
 
     let mut passphrase_fixed: [u8; 32] = [0; 32];
 
@@ -74,22 +82,30 @@ pub fn init(port: u16, peer_addr: SocketAddr, passphrase: &str) -> anyhow::Resul
     let cipher = Cipher::new_256(&passphrase_fixed);
     let cipher_2 = Cipher::new_256(&passphrase_fixed);
 
-    thread::spawn(move || start_shell(peer_addr, cipher).map_err(|e| {
-        println!("{}", e);
-        std::process::exit(1);
-    }));
-    thread::spawn(move || start_server(message_tx, peer_addr, port, cipher_2).map_err(|e| {
-        println!("{}", e);
-        std::process::exit(1);
-    }));
+    let peer_addr_ip_only = peer_addrs.iter().map(|socket| socket.ip()).collect::<HashSet<IpAddr>>();
+
+    thread::spawn(move || {
+        start_shell(Vec::from_iter(peer_addrs), cipher).map_err(|e| {
+            println!("{}", e);
+            std::process::exit(1);
+        }
+    )});
+    thread::spawn(move || {
+        start_server(message_tx, peer_addr_ip_only, port, cipher_2).map_err(|e| {
+            println!("{}", e);
+            std::process::exit(1);
+        })
+    });
 
     loop {
-        println!("{peer_addr}: {}", message_rx.recv()?);
+        let msg = message_rx.recv()?;
+
+        println!("{}: {}", msg.peer, msg.message);
     }
 }
 
 /// Starts the main thread for the server which listens to the given port.
-pub fn start_server(message_tx: Sender<String>, peer_addr: SocketAddr, port: u16, cipher: Cipher) -> io::Result<()> {
+pub fn start_server(message_tx: Sender<Message>, peer_addrs: HashSet<IpAddr>, port: u16, cipher: Cipher) -> io::Result<()> {
     let listener = match TcpListener::bind(format!("0.0.0.0:{port}")) {
         Ok(listener) => listener,
         Err(_) => return Err(io::Error::new(io::ErrorKind::Other, "Failed listening to given port. Maybe the program doesn't have the required privileges or another program is already listening to that port?")),
@@ -97,118 +113,137 @@ pub fn start_server(message_tx: Sender<String>, peer_addr: SocketAddr, port: u16
     
     log::info!("Server successfully started.");
 
+    let cipher = Arc::new(cipher);
+
     for stream in listener.incoming() {
-        let mut stream = match stream {
-            Ok(stream) => stream,
-            Err(_) => {
-                log::warn!(
-                    "Something went wrong whilst getting stream, skipping. Possibly invalid data?"
-                );
-                continue;
+        let message_tx_clone = message_tx.clone();
+        let peer_addrs_clone = peer_addrs.clone();
+        let cipher_clone = Arc::clone(&cipher);
+
+        // Create new thread for each stream
+        thread::spawn(|| {
+            let stream = match stream {
+                Ok(stream) => stream,
+                Err(_) => {
+                    log::warn!(
+                        "Something went wrong whilst getting stream, skipping. Possibly invalid data?"
+                    );
+                    return;
+                }
+            };
+
+
+            let mut stream = stream;
+
+            let message_tx = message_tx_clone;
+            let peer_addrs = peer_addrs_clone;
+
+            let cipher = cipher_clone;
+
+            let stream_peer_addr = match stream.peer_addr() {
+                Ok(peer_addr) => peer_addr,
+                Err(_) => {
+                    log::warn!("Couldn't obtain stream's peer socket address, skipping.");
+                    return;
+                }
+            };
+
+            if stream.set_nonblocking(true).is_err() {
+                log::warn!("Couldn't set stream to nonblocking, skipping.");
+                return;
             }
-        };
 
-        let stream_peer_addr = match stream.peer_addr() {
-            Ok(peer_addr) => peer_addr,
-            Err(_) => {
-                log::warn!("Couldn't obtain stream's peer socket address, skipping.");
-                continue;
+            // There is no point in checking if the ports match.
+            if !peer_addrs.contains(&stream_peer_addr.ip()) {
+                log::warn!("Permission denied ({stream_peer_addr})");
+                if stream.write(format!("Permission denied.\n\nYour socket address doesn't match the given peer's address.\nYour socket address: {stream_peer_addr}").as_bytes()).is_err() {
+                        log::warn!("Failed writing error to TCP stream, skipping.");
+                    };
+                return;
             }
-        };
 
-        if stream.set_nonblocking(true).is_err() {
-            log::warn!("Couldn't set stream to nonblocking, skipping.");
-            continue;
-        }
-
-        // There is no point in checking if the ports match.
-        if stream_peer_addr.ip() != peer_addr.ip() {
-            log::warn!("Permission denied ({stream_peer_addr})");
-            if stream.write(format!("Permission denied.\n\nYour socket address doesn't match the given peer's address.\nYour socket address: {stream_peer_addr}\nGiven peer's address: {peer_addr}").as_bytes()).is_err() {
-                    log::warn!("Failed writing error to TCP stream, skipping.");
-                };
-            continue;
-        }
-
-        log::debug!("Peer successfully established connection on their end ({stream_peer_addr})");
-
-        loop {
-            let mut msg_buf: [u8; MAX_BUF_SIZE] = [0; MAX_BUF_SIZE];
+            log::debug!("Peer successfully established connection on their end ({stream_peer_addr})");
 
             loop {
-                match stream.read(&mut msg_buf) {
-                    Ok(_) => break,
-                    Err(_) => {}
+                let mut msg_buf: [u8; MAX_BUF_SIZE] = [0; MAX_BUF_SIZE];
+
+                loop {
+                    match stream.read(&mut msg_buf) {
+                        Ok(_) => break,
+                        Err(_) => {}
+                    };
+                }
+
+                let msg = match std::str::from_utf8(&msg_buf) {
+                    Ok(msg) => msg,
+                    Err(_) => {
+                        log::error!("Peer's message doesn't contain valid UTF-8 data, not processing.");
+                        continue;
+                    }
                 };
-            }
 
-            let msg = match std::str::from_utf8(&msg_buf) {
-                Ok(msg) => msg,
-                Err(_) => {
-                    log::error!("Peer's message doesn't contain valid UTF-8 data, not processing.");
-                    continue;
-                }
-            };
+                // Parsed byte slice
+                let parsed_msg = match parse_stringified_slice(msg.clone().to_string()) {
+                    Ok(msg) => msg,
+                    Err(e) => {
+                        log::error!("{}", e);
+                        continue;
+                    },
+                };
 
-            // Parsed byte slice
-            let parsed_msg = match parse_stringified_slice(msg.clone().to_string()) {
-                Ok(msg) => msg,
-                Err(e) => {
-                    log::error!("{}", e);
-                    continue;
-                },
-            };
+                let iv = b"This is the initialization vect.";
 
-            let iv = b"This is the initialization vect.";
+                let msg_dec = cipher.cbc_decrypt(iv, parsed_msg.as_slice());
 
-            let msg_dec = cipher.cbc_decrypt(iv, parsed_msg.as_slice());
+                let msg_plaintext = match std::string::String::from_utf8(msg_dec) {
+                    Ok(plaintext) => plaintext,
+                    Err(_) => {
+                        log::error!("Message isn't valid UTF-8 data, not sending message.");
+                        continue;
+                    }
+                };
 
-            let msg_plaintext = match std::string::String::from_utf8(msg_dec) {
-                Ok(plaintext) => plaintext,
-                Err(_) => {
-                    log::error!("Message isn't valid UTF-8 data, not sending message.");
-                    continue;
-                }
-            };
-
-            if !msg_plaintext.is_empty() {
-                if message_tx.send(msg_plaintext).is_err() {
-                    log::warn!("Failed transmitting stream's message.");
+                if !msg_plaintext.is_empty() {
+                    if message_tx.send(Message { peer: stream_peer_addr, message: msg_plaintext }).is_err() {
+                        log::warn!("Failed transmitting stream's message.");
+                    } else {
+                        log::info!("Successfully transmitting client's message.");
+                    }
                 } else {
-                    log::info!("Successfully transmitting client's message.");
-                }
-            } else {
-                if stream.write(b"Message cannot be empty.").is_err() {
-                    log::warn!("Failed writing message rejection to TCP stream, skipping.");
+                    if stream.write(b"Message cannot be empty.").is_err() {
+                        log::warn!("Failed writing message rejection to TCP stream, skipping.");
+                    }
                 }
             }
-        }
+
+        });
     }
 
     Ok(())
 }
 
-pub fn start_shell(peer_addr: SocketAddr, cipher: Cipher) -> anyhow::Result<()> {
+pub fn start_shell(mut peer_addrs: Vec<SocketAddr>, cipher: Cipher) -> anyhow::Result<()> {
     let mut stdin = io::stdin().lock();
 
     log::debug!("Connecting to peer...");
 
-    let mut stream;
+    let mut streams = vec![];
 
-    loop {
+    while let Some(peer_addr) = peer_addrs.first() {
         match TcpStream::connect(peer_addr) {
-            Ok(new_stream) => {
-                stream = new_stream;
-                break;
+            Ok(stream) => {
+                log::debug!("Successfully established connection with peer ({peer_addr})");
+                peer_addrs.remove(0);
+                streams.push(stream);
             },
             Err(_) => {
-                log::warn!("Connection to TCP failed, retrying in 3000 millis...");
+                log::warn!("Connection via TCP failed ({peer_addr}), retrying in 3000 millis...");
                 thread::sleep(Duration::from_millis(3000));
             }
         };
     }
 
-    log::debug!("Connection successfully established with peer's end.");
+    log::info!("Connection successfully established with all peers.");
 
     loop {
         let mut msg_buf = String::new();
@@ -225,8 +260,10 @@ pub fn start_shell(peer_addr: SocketAddr, cipher: Cipher) -> anyhow::Result<()> 
 
         let encrypted_msg_str = parse_vec_to_string(encrypted_msg);
 
-        if stream.write(encrypted_msg_str.as_bytes()).is_err() {
-            log::warn!("Failed sending message to TCP stream; not sent.");
+        for stream in streams.iter_mut() {
+            if stream.write(encrypted_msg_str.as_bytes()).is_err() {
+                log::warn!("Failed sending message to TCP stream ({}); not sent.", stream.peer_addr()?);
+            }
         }
     }
 }
