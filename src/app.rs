@@ -1,4 +1,5 @@
 use std::env;
+use std::time::Duration;
 use std::io::{self, BufRead, Read, Write};
 use std::net::SocketAddr;
 use std::net::TcpListener;
@@ -6,6 +7,10 @@ use std::net::TcpStream;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
 use libaes::Cipher;
+
+// If the message written to the stream is bigger than the maximum buffer size, it will create a
+// new buffer as if it was a separate message.
+pub const MAX_BUF_SIZE: usize = 1024;
 
 /// Converts slice to a stringified form
 ///
@@ -29,7 +34,7 @@ pub fn parse_stringified_slice<'a>(msg: String) -> io::Result<Vec<u8>>
     let mut msg_no_weird_chars = String::new();
 
     for c in msg.chars() {
-        if c != '[' && c != ']' && c != ' ' {
+        if c != '[' && c != ']' && c != ' ' && c != '\0' {
             msg_no_weird_chars.push(c);
         }
     }
@@ -125,52 +130,59 @@ pub fn start_server(message_tx: Sender<String>, peer_addr: SocketAddr, port: u16
             continue;
         }
 
-        log::debug!("Connection successfully established with peer ({stream_peer_addr})");
-
-        let mut msg = String::new();
+        log::debug!("Peer successfully established connection on their end ({stream_peer_addr})");
 
         loop {
-            match stream.read_to_string(&mut msg) {
-                Ok(_) => break,
-                Err(_) => {}
+            let mut msg_buf: [u8; MAX_BUF_SIZE] = [0; MAX_BUF_SIZE];
+
+            loop {
+                match stream.read(&mut msg_buf) {
+                    Ok(_) => break,
+                    Err(_) => {}
+                };
+            }
+
+            let msg = match std::str::from_utf8(&msg_buf) {
+                Ok(msg) => msg,
+                Err(_) => {
+                    log::error!("Peer's message doesn't contain valid UTF-8 data, not processing.");
+                    continue;
+                }
             };
-        }
 
-        // Parsed byte slice
-        let parsed_msg = match parse_stringified_slice(msg.clone()) {
-            Ok(msg) => msg,
-            Err(e) => {
-                log::error!("{}", e);
-                continue;
-            },
-        };
+            // Parsed byte slice
+            let parsed_msg = match parse_stringified_slice(msg.clone().to_string()) {
+                Ok(msg) => msg,
+                Err(e) => {
+                    log::error!("{}", e);
+                    continue;
+                },
+            };
 
+            let iv = b"This is the initialization vect.";
 
-        let iv = b"This is the initialization vect.";
+            let msg_dec = cipher.cbc_decrypt(iv, parsed_msg.as_slice());
 
-        let msg_dec = cipher.cbc_decrypt(iv, parsed_msg.as_slice());
+            let msg_plaintext = match std::string::String::from_utf8(msg_dec) {
+                Ok(plaintext) => plaintext,
+                Err(_) => {
+                    log::error!("Message isn't valid UTF-8 data, not sending message.");
+                    continue;
+                }
+            };
 
-        let msg_plaintext = match std::string::String::from_utf8(msg_dec) {
-            Ok(plaintext) => plaintext,
-            Err(_) => {
-                log::error!("Message isn't valid UTF-8 data, not sending message.");
-                continue;
-            }
-        };
-
-        if !msg_plaintext.is_empty() {
-            if message_tx.send(msg_plaintext).is_err() {
-                log::warn!("Failed transmitting stream's message.");
+            if !msg_plaintext.is_empty() {
+                if message_tx.send(msg_plaintext).is_err() {
+                    log::warn!("Failed transmitting stream's message.");
+                } else {
+                    log::info!("Successfully transmitting client's message.");
+                }
             } else {
-                log::info!("Successfully transmitting client's message.");
-            }
-        } else {
-            if stream.write(b"Message cannot be empty.").is_err() {
-                log::warn!("Failed writing message rejection to TCP stream, skipping.");
+                if stream.write(b"Message cannot be empty.").is_err() {
+                    log::warn!("Failed writing message rejection to TCP stream, skipping.");
+                }
             }
         }
-
-        log::debug!("Connection ended with peer ({stream_peer_addr})");
     }
 
     Ok(())
@@ -178,6 +190,26 @@ pub fn start_server(message_tx: Sender<String>, peer_addr: SocketAddr, port: u16
 
 pub fn start_shell(peer_addr: SocketAddr, cipher: Cipher) -> anyhow::Result<()> {
     let mut stdin = io::stdin().lock();
+
+    log::debug!("Connecting to peer...");
+
+    let mut stream;
+
+    loop {
+        match TcpStream::connect(peer_addr) {
+            Ok(new_stream) => {
+                stream = new_stream;
+                break;
+            },
+            Err(_) => {
+                log::warn!("Connection to TCP failed, retrying in 3000 millis...");
+                thread::sleep(Duration::from_millis(3000));
+            }
+        };
+    }
+
+    log::debug!("Connection successfully established with peer's end.");
+
     loop {
         let mut msg_buf = String::new();
         stdin.read_line(&mut msg_buf)?;
@@ -189,17 +221,9 @@ pub fn start_shell(peer_addr: SocketAddr, cipher: Cipher) -> anyhow::Result<()> 
 
         let encrypted_msg = cipher.cbc_encrypt(iv, msg.as_bytes());
 
-        log::debug!("Encryption successful");
-        log::debug!("Ciphertext: {:?}", encrypted_msg);
+        log::debug!("Encryption successful.");
 
         let encrypted_msg_str = parse_vec_to_string(encrypted_msg);
-
-        log::debug!("Connecting to peer...");
-
-        let mut stream = match TcpStream::connect(peer_addr) {
-            Ok(stream) => stream,
-            Err(_) => return Err(anyhow::Error::new(std::io::Error::new(io::ErrorKind::ConnectionRefused, "Failed to connect to the peer's socket address."))),
-        };
 
         if stream.write(encrypted_msg_str.as_bytes()).is_err() {
             log::warn!("Failed sending message to TCP stream; not sent.");

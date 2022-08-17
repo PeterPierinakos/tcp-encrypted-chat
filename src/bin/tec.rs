@@ -36,7 +36,7 @@ fn handle_input() -> anyhow::Result<()> {
         ))),
     };
 
-    println!("Enter encryption / decryption passphrase (must be exactly 32 characters long) (peer has to use the same one): ");
+    println!("Enter encryption / decryption passphrase (must be exactly 32 characters long) (peer has to use the same one)");
     print!("> ");
     io::stdout().flush()?;
     let mut buffer_passphrase = String::new();
