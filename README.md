@@ -16,6 +16,6 @@ Upon starting the program, you have to enter the following things:
 
 - The port the server should listen to
 - The peer's socket address (e.g. <code>57.11.125.99:5542</code>). If there is more than one peer you want to send your messages to, add extra socket addresses separated by commas (e.g. <code>57.11.125.99:5542,92.69.22.21:3002</code>)
-- The passphrase for message encryption (has to be exactly 32 characters long)
+- The passphrase for message encryption and decryption (has to be exactly 32 characters long, all peers have to use the same one because AES is symmetric)
 
 If the connection isn't successfully established with the peer(s), it will keep retrying to connect until it successfully establishes a connection. Have fun!
