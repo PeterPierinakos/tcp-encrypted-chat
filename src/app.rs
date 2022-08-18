@@ -275,7 +275,13 @@ pub fn handle_other_arguments(args: Vec<String>) -> bool {
 
     match first_arg.as_str() {
         "-v" | "--version" => println!("Version: {}", env::var("CARGO_PKG_VERSION").unwrap_or("could not detect Cargo version. Make sure you are running the program with the Rust's Cargo package manager.".to_string())),
-        "-h" | "--help" => println!("There is no savior."),
+        "-h" | "--help" => println!(
+            "
+-v or --version | Show program's version
+-h or --help | Show this message
+--with-logs | Run the program with env_logger initialized (outputs all logs to stdout)
+            "
+        ),
         "--with-logs" => {
             env::set_var("RUST_LOG", "debug");
             env_logger::init();
