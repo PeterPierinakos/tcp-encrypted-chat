@@ -207,7 +207,7 @@ pub fn start_server(message_tx: Sender<Message>, peer_addrs: HashSet<IpAddr>, po
                     if message_tx.send(Message { peer: stream_peer_addr, message: msg_plaintext }).is_err() {
                         log::warn!("Failed transmitting stream's message.");
                     } else {
-                        log::info!("Successfully transmitting client's message.");
+                        log::debug!("Successfully transmitting client's message.");
                     }
                 } else {
                     if stream.write(b"Message cannot be empty.").is_err() {
