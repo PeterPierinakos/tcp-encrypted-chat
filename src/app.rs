@@ -52,8 +52,10 @@ pub fn parse_stringified_slice<'a>(msg: String) -> io::Result<Vec<u8>>
 {
     let mut msg_no_weird_chars = String::new();
 
+    let illegal_chars = HashSet::from(['[', ']', ' ', '\0']);
+
     for c in msg.chars() {
-        if c != '[' && c != ']' && c != ' ' && c != '\0' {
+        if !illegal_chars.contains(&c) {
             msg_no_weird_chars.push(c);
         }
     }
@@ -163,75 +165,58 @@ pub fn start_server<'a>(message_tx: Sender<Message>, peer_addrs: HashSet<IpAddr>
 
             log::debug!("Peer successfully established connection on their end ({stream_peer_addr})");
 
-            let mut iv_buf: [u8; MAX_BUF_SIZE] = [0; MAX_BUF_SIZE];
-            let mut iv_utf8: &str;
-            let mut iv: [u8; 32] = [0; 32];
-
             loop {
-                // First message must be the IV which is used for ciphertext decryption
-                loop {
-                    match stream.read(&mut iv_buf) {
-                        Ok(_) => {
-                            match std::str::from_utf8(&iv_buf) {
-                                Ok(iv) => {
-                                    iv_utf8 = iv;
-                                    break;
-                                },
-                                Err(_) => {
-                                    log::error!("Peer's IV isn't valid. ({stream_peer_addr})");
-                                    continue;
-                                }
-                            };
-                        },
-                        Err(_) => {},
-                    }
-                };
-
-                match parse_stringified_slice(iv_utf8.to_string()) {
-                    Ok(new_iv) => {
-                        if new_iv.len() != 32 {
-                            log::error!("Peer's IV isn't equal to 32 length. ({stream_peer_addr})");
-                            continue;
-                        }
-                        else {
-                            for (i, b) in new_iv.iter().enumerate() {
-                                iv[i] = *b;
-                            }
-                        }
-                    },
-                    Err(_) => {
-                        log::error!("Peer's IV isn't valid. ({stream_peer_addr})");
-                        continue;
-                    },
-                };
-
-                break;
-            }
-
-            drop(iv_buf);
-            drop(iv_utf8);
-
-            log::debug!("Peer's IV: {:?} ({})", iv, stream_peer_addr);
-
-            loop {
-                let mut msg_buf: [u8; MAX_BUF_SIZE] = [0; MAX_BUF_SIZE];
+                let mut data_buf: [u8; MAX_BUF_SIZE] = [0; MAX_BUF_SIZE];
 
                 loop {
-                    match stream.read(&mut msg_buf) {
+                    match stream.read(&mut data_buf) {
                         Ok(_) => break,
                         Err(_) => {}
                     };
                 }
 
-                let msg = match std::str::from_utf8(&msg_buf) {
-                    Ok(msg) => msg,
+                let data = match std::str::from_utf8(&data_buf) {
+                    Ok(data) => data,
                     Err(_) => {
                         log::error!("Peer's message doesn't contain valid UTF-8 data, not processing. ({stream_peer_addr})");
                         continue;
                     }
                 };
 
-                // Parsed byte slice
+                // The first line is the IV and the rest is the message being sent
+                let data_split = data.to_string();
+                let data_split = data_split.split('\n').collect::<Vec<&str>>();
+
+                // Treat the text before the newline as the IV and the rest as the ciphertext (as
+                // seen with the comments below)
+                let iv_buf = data_split[0];
+
+                let iv_utf8 = match std::str::from_utf8(iv_buf.trim().as_bytes()) {
+                    Ok(iv_utf8) => iv_utf8,
+                    Err(_) => {
+                        log::error!("Peer's IV doesn't contain valid UTF-8 data, not processing. ({stream_peer_addr})");
+                        continue;
+                    },
+                };
+
+                let iv = match parse_stringified_slice(iv_utf8.to_string()) {
+                    Ok(iv) => iv,
+                    Err(_) => {
+                        log::error!("Peer's IV contains invalid data. ({stream_peer_addr})");
+                        continue;
+                    },
+                };
+
+                log::debug!("Peer's IV: {iv:?} ({stream_peer_addr})");
+
+                // If more than one newline was found (the first one is reserved for IV), then the
+                // rest which is the ciphertext to be sent will be joined together into a single
+                // string. This string may look something like this in some cases if extra newlines
+                // exist:
+                // [23,64,92,77][11,44,99]
+                let msg = data_split[1..].to_vec().iter().map(|item| *item).collect::<String>();
+
+                // Parsed byte slice from all the messages
                 let parsed_msg = match parse_stringified_slice(msg.clone().to_string()) {
                     Ok(msg) => msg,
                     Err(e) => {
@@ -295,20 +280,6 @@ pub fn start_shell(mut peer_addrs: Vec<SocketAddr>, passphrase: [u8; 32]) -> any
 
     let cipher = Cipher::new_256(&passphrase);
 
-    let iv = gen_iv();
-    log::debug!("Your generated IV: {:?}", iv);
-
-    let iv_str = parse_vec_to_string(iv.to_vec());
-
-    for stream in streams.iter_mut() {
-        if stream.write(iv_str.as_bytes()).is_err() {
-            match stream.peer_addr() {
-                Ok(peer_addr) => log::warn!("Failed writing IV to the TCP stream ({}).", peer_addr),
-                Err(_) => log::warn!("Failed writing IV to the TCP stream (unknown IP)"),
-            }
-        }
-    }
-
     loop {
         let mut msg_buf = String::new();
         stdin.read_line(&mut msg_buf)?;
@@ -319,14 +290,22 @@ pub fn start_shell(mut peer_addrs: Vec<SocketAddr>, passphrase: [u8; 32]) -> any
             continue;
         }
 
+        let iv = gen_iv();
+        log::debug!("Your generated IV: {:?}", iv);
+
+        let iv_str = parse_vec_to_string(iv.to_vec());
+        let iv_str = iv_str.as_str();
+
         let encrypted_msg = cipher.cbc_encrypt(&iv, msg.as_bytes());
 
         log::debug!("Message encryption successful.");
 
         let encrypted_msg_str = parse_vec_to_string(encrypted_msg);
 
+        let full_msg = [iv_str, "\n", encrypted_msg_str.as_str()].concat();
+
         for stream in streams.iter_mut() {
-            if stream.write(encrypted_msg_str.as_bytes()).is_err() {
+            if stream.write(full_msg.as_bytes()).is_err() {
                 match stream.peer_addr() {
                     Ok(peer_addr) => log::warn!("Failed sending message to TCP stream ({}); not sent.", peer_addr),
                     Err(_) => log::warn!("Failed sending message to TCP stream (unknown IP); not sent."),
