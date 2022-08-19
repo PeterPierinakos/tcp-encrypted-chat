@@ -161,10 +161,6 @@ pub fn start_server<'a>(message_tx: Sender<Message>, peer_addrs: HashSet<IpAddr>
                 return;
             }
 
-            let iv = gen_iv();
-
-            log::debug!("Peer's generated IV ({stream_peer_addr}): {:?}", iv);
-
             log::debug!("Peer successfully established connection on their end ({stream_peer_addr})");
 
             loop {
@@ -194,7 +190,7 @@ pub fn start_server<'a>(message_tx: Sender<Message>, peer_addrs: HashSet<IpAddr>
                     },
                 };
 
-                let msg_dec = cipher.cbc_decrypt(&iv, parsed_msg.as_slice());
+                let msg_dec = cipher.cbc_decrypt(&passphrase, parsed_msg.as_slice());
 
                 let msg_plaintext = match std::string::String::from_utf8(msg_dec) {
                     Ok(plaintext) => plaintext,
