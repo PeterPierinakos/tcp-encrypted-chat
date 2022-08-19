@@ -65,7 +65,7 @@ pub fn parse_stringified_slice<'a>(msg: String) -> io::Result<Vec<u8>>
     for num in msg_splitted {
         let num = match num.parse::<u8>() {
             Ok(num) => num,
-            Err(_) => return Err(io::Error::new(io::ErrorKind::InvalidData, format!("Slice has an illegal character ({num})."))),
+            Err(_) => return Err(io::Error::new(io::ErrorKind::InvalidData, format!("Slice has an illegal character (\"{num}\")."))),
         };
 
         vec.push(num);
