@@ -1,5 +1,5 @@
 use std::env;
-use std::sync::Arc;
+use rand::prelude::*;
 use std::net::IpAddr;
 use std::collections::HashSet;
 use std::time::Duration;
@@ -32,6 +32,17 @@ pub fn parse_vec_to_string(vec: Vec<u8>) -> String {
     string.pop();
     string.push(']');
     string
+}
+
+pub fn gen_iv() -> [u8; 32] {
+    let mut rng = rand::thread_rng();
+    let mut iv: [u8; 32] = [0; 32];
+
+    for i in 0..iv.len() {
+        iv[i] = rng.gen_range(0..128);
+    }
+
+    iv
 }
 
 /// Converts slice in a string form to a real slice
@@ -74,24 +85,18 @@ pub fn init(port: u16, peer_addrs: HashSet<SocketAddr>, passphrase: &str) -> any
         passphrase_fixed[i] = *b;
     }
 
-    log::debug!("Fixed passphrase: {:?} size: {}", passphrase_fixed, passphrase_fixed.len());
-
-    // Cipher needs to be sent to both the server and the shell for encryption and decryption, so
-    // create twice.
-    // TODO: Find a way to send cipher between threads safely without having to create two ciphers
-    let cipher = Cipher::new_256(&passphrase_fixed);
-    let cipher_2 = Cipher::new_256(&passphrase_fixed);
+    log::debug!("Fixed size passphrase: {:?}", passphrase_fixed);
 
     let peer_addr_ip_only = peer_addrs.iter().map(|socket| socket.ip()).collect::<HashSet<IpAddr>>();
 
     thread::spawn(move || {
-        start_shell(Vec::from_iter(peer_addrs), cipher).map_err(|e| {
+        start_shell(Vec::from_iter(peer_addrs), passphrase_fixed).map_err(|e| {
             println!("{}", e);
             std::process::exit(1);
         }
     )});
     thread::spawn(move || {
-        start_server(message_tx, peer_addr_ip_only, port, cipher_2).map_err(|e| {
+        start_server(message_tx, peer_addr_ip_only, port, passphrase_fixed).map_err(|e| {
             println!("{}", e);
             std::process::exit(1);
         })
@@ -105,7 +110,7 @@ pub fn init(port: u16, peer_addrs: HashSet<SocketAddr>, passphrase: &str) -> any
 }
 
 /// Starts the main thread for the server which listens to the given port.
-pub fn start_server(message_tx: Sender<Message>, peer_addrs: HashSet<IpAddr>, port: u16, cipher: Cipher) -> io::Result<()> {
+pub fn start_server<'a>(message_tx: Sender<Message>, peer_addrs: HashSet<IpAddr>, port: u16, passphrase: [u8; 32]) -> io::Result<()> {
     let listener = match TcpListener::bind(format!("0.0.0.0:{port}")) {
         Ok(listener) => listener,
         Err(_) => return Err(io::Error::new(io::ErrorKind::Other, "Failed listening to given port. Maybe the program doesn't have the required privileges or another program is already listening to that port?")),
@@ -113,15 +118,13 @@ pub fn start_server(message_tx: Sender<Message>, peer_addrs: HashSet<IpAddr>, po
     
     log::info!("Server successfully started.");
 
-    let cipher = Arc::new(cipher);
-
     for stream in listener.incoming() {
         let message_tx_clone = message_tx.clone();
         let peer_addrs_clone = peer_addrs.clone();
-        let cipher_clone = Arc::clone(&cipher);
+        let passphrase_clone = passphrase.clone();
 
         // Create new thread for each stream
-        thread::spawn(|| {
+        thread::spawn(move || {
             let stream = match stream {
                 Ok(stream) => stream,
                 Err(_) => {
@@ -132,13 +135,14 @@ pub fn start_server(message_tx: Sender<Message>, peer_addrs: HashSet<IpAddr>, po
                 }
             };
 
+            let passphrase = passphrase_clone;
+
+            let cipher = Cipher::new_256(&passphrase);
 
             let mut stream = stream;
 
             let message_tx = message_tx_clone;
             let peer_addrs = peer_addrs_clone;
-
-            let cipher = cipher_clone;
 
             let stream_peer_addr = match stream.peer_addr() {
                 Ok(peer_addr) => peer_addr,
@@ -148,11 +152,6 @@ pub fn start_server(message_tx: Sender<Message>, peer_addrs: HashSet<IpAddr>, po
                 }
             };
 
-            if stream.set_nonblocking(true).is_err() {
-                log::warn!("Couldn't set stream to nonblocking, skipping.");
-                return;
-            }
-
             // There is no point in checking if the ports match.
             if !peer_addrs.contains(&stream_peer_addr.ip()) {
                 log::warn!("Permission denied ({stream_peer_addr})");
@@ -161,6 +160,10 @@ pub fn start_server(message_tx: Sender<Message>, peer_addrs: HashSet<IpAddr>, po
                     };
                 return;
             }
+
+            let iv = gen_iv();
+
+            log::debug!("Peer's generated IV ({stream_peer_addr}): {:?}", iv);
 
             log::debug!("Peer successfully established connection on their end ({stream_peer_addr})");
 
@@ -191,14 +194,12 @@ pub fn start_server(message_tx: Sender<Message>, peer_addrs: HashSet<IpAddr>, po
                     },
                 };
 
-                let iv = b"This is the initialization vect.";
-
-                let msg_dec = cipher.cbc_decrypt(iv, parsed_msg.as_slice());
+                let msg_dec = cipher.cbc_decrypt(&iv, parsed_msg.as_slice());
 
                 let msg_plaintext = match std::string::String::from_utf8(msg_dec) {
                     Ok(plaintext) => plaintext,
                     Err(_) => {
-                        log::error!("Message isn't valid UTF-8 data, not sending message.");
+                        log::error!("Received message isn't valid UTF-8 data, not showing message.");
                         continue;
                     }
                 };
@@ -210,6 +211,7 @@ pub fn start_server(message_tx: Sender<Message>, peer_addrs: HashSet<IpAddr>, po
                         log::debug!("Successfully transmitting client's message.");
                     }
                 } else {
+                    log::error!("Received empty message, skipping.");
                     if stream.write(b"Message cannot be empty.").is_err() {
                         log::warn!("Failed writing message rejection to TCP stream, skipping.");
                     }
@@ -222,7 +224,7 @@ pub fn start_server(message_tx: Sender<Message>, peer_addrs: HashSet<IpAddr>, po
     Ok(())
 }
 
-pub fn start_shell(mut peer_addrs: Vec<SocketAddr>, cipher: Cipher) -> anyhow::Result<()> {
+pub fn start_shell(mut peer_addrs: Vec<SocketAddr>, passphrase: [u8; 32]) -> anyhow::Result<()> {
     let mut stdin = io::stdin().lock();
 
     log::debug!("Connecting to peer...");
@@ -245,24 +247,32 @@ pub fn start_shell(mut peer_addrs: Vec<SocketAddr>, cipher: Cipher) -> anyhow::R
 
     log::info!("Connection successfully established with all peers.");
 
+    let cipher = Cipher::new_256(&passphrase);
+
+    let iv = gen_iv();
+    log::debug!("Your generated IV: {:?}", iv);
+
     loop {
         let mut msg_buf = String::new();
         stdin.read_line(&mut msg_buf)?;
         let msg = msg_buf.trim();
 
-        let iv = b"This is the initialization vect.";
+        if msg.is_empty() {
+            log::error!("Message cannot be empty.");
+            continue;
+        }
 
-        log::debug!("Encrypting message...");
+        let encrypted_msg = cipher.cbc_encrypt(&iv, msg.as_bytes());
 
-        let encrypted_msg = cipher.cbc_encrypt(iv, msg.as_bytes());
-
-        log::debug!("Encryption successful.");
+        log::debug!("Message encryption successful.");
 
         let encrypted_msg_str = parse_vec_to_string(encrypted_msg);
 
         for stream in streams.iter_mut() {
             if stream.write(encrypted_msg_str.as_bytes()).is_err() {
                 log::warn!("Failed sending message to TCP stream ({}); not sent.", stream.peer_addr()?);
+            } else {
+                log::debug!("Message sent.");
             }
         }
     }
