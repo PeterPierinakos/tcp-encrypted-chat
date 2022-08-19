@@ -163,6 +163,56 @@ pub fn start_server<'a>(message_tx: Sender<Message>, peer_addrs: HashSet<IpAddr>
 
             log::debug!("Peer successfully established connection on their end ({stream_peer_addr})");
 
+            let mut iv_buf: [u8; MAX_BUF_SIZE] = [0; MAX_BUF_SIZE];
+            let mut iv_utf8: &str;
+            let mut iv: [u8; 32] = [0; 32];
+
+            loop {
+                // First message must be the IV which is used for ciphertext decryption
+                loop {
+                    match stream.read(&mut iv_buf) {
+                        Ok(_) => {
+                            match std::str::from_utf8(&iv_buf) {
+                                Ok(iv) => {
+                                    iv_utf8 = iv;
+                                    break;
+                                },
+                                Err(_) => {
+                                    log::error!("Peer's IV isn't valid. ({stream_peer_addr})");
+                                    continue;
+                                }
+                            };
+                        },
+                        Err(_) => {},
+                    }
+                };
+
+                match parse_stringified_slice(iv_utf8.to_string()) {
+                    Ok(new_iv) => {
+                        if new_iv.len() != 32 {
+                            log::error!("Peer's IV isn't equal to 32 length. ({stream_peer_addr})");
+                            continue;
+                        }
+                        else {
+                            for (i, b) in new_iv.iter().enumerate() {
+                                iv[i] = *b;
+                            }
+                        }
+                    },
+                    Err(_) => {
+                        log::error!("Peer's IV isn't valid. ({stream_peer_addr})");
+                        continue;
+                    },
+                };
+
+                break;
+            }
+
+            drop(iv_buf);
+            drop(iv_utf8);
+
+            log::debug!("Peer's IV: {:?} ({})", iv, stream_peer_addr);
+
             loop {
                 let mut msg_buf: [u8; MAX_BUF_SIZE] = [0; MAX_BUF_SIZE];
 
@@ -176,7 +226,7 @@ pub fn start_server<'a>(message_tx: Sender<Message>, peer_addrs: HashSet<IpAddr>
                 let msg = match std::str::from_utf8(&msg_buf) {
                     Ok(msg) => msg,
                     Err(_) => {
-                        log::error!("Peer's message doesn't contain valid UTF-8 data, not processing.");
+                        log::error!("Peer's message doesn't contain valid UTF-8 data, not processing. ({stream_peer_addr})");
                         continue;
                     }
                 };
@@ -190,7 +240,7 @@ pub fn start_server<'a>(message_tx: Sender<Message>, peer_addrs: HashSet<IpAddr>
                     },
                 };
 
-                let msg_dec = cipher.cbc_decrypt(&passphrase, parsed_msg.as_slice());
+                let msg_dec = cipher.cbc_decrypt(&iv, parsed_msg.as_slice());
 
                 let msg_plaintext = match std::string::String::from_utf8(msg_dec) {
                     Ok(plaintext) => plaintext,
@@ -202,14 +252,14 @@ pub fn start_server<'a>(message_tx: Sender<Message>, peer_addrs: HashSet<IpAddr>
 
                 if !msg_plaintext.is_empty() {
                     if message_tx.send(Message { peer: stream_peer_addr, message: msg_plaintext }).is_err() {
-                        log::warn!("Failed transmitting stream's message.");
+                        log::warn!("Failed transmitting stream's message. ({stream_peer_addr})");
                     } else {
-                        log::debug!("Successfully transmitting client's message.");
+                        log::debug!("Successfully transmitting client's message. ({stream_peer_addr})");
                     }
                 } else {
                     log::error!("Received empty message, skipping.");
                     if stream.write(b"Message cannot be empty.").is_err() {
-                        log::warn!("Failed writing message rejection to TCP stream, skipping.");
+                        log::warn!("Failed writing message rejection to TCP stream, skipping. ({stream_peer_addr})");
                     }
                 }
             }
@@ -248,6 +298,17 @@ pub fn start_shell(mut peer_addrs: Vec<SocketAddr>, passphrase: [u8; 32]) -> any
     let iv = gen_iv();
     log::debug!("Your generated IV: {:?}", iv);
 
+    let iv_str = parse_vec_to_string(iv.to_vec());
+
+    for stream in streams.iter_mut() {
+        if stream.write(iv_str.as_bytes()).is_err() {
+            match stream.peer_addr() {
+                Ok(peer_addr) => log::warn!("Failed writing IV to the TCP stream ({}).", peer_addr),
+                Err(_) => log::warn!("Failed writing IV to the TCP stream (unknown IP)"),
+            }
+        }
+    }
+
     loop {
         let mut msg_buf = String::new();
         stdin.read_line(&mut msg_buf)?;
@@ -266,9 +327,10 @@ pub fn start_shell(mut peer_addrs: Vec<SocketAddr>, passphrase: [u8; 32]) -> any
 
         for stream in streams.iter_mut() {
             if stream.write(encrypted_msg_str.as_bytes()).is_err() {
-                log::warn!("Failed sending message to TCP stream ({}); not sent.", stream.peer_addr()?);
-            } else {
-                log::debug!("Message sent.");
+                match stream.peer_addr() {
+                    Ok(peer_addr) => log::warn!("Failed sending message to TCP stream ({}); not sent.", peer_addr),
+                    Err(_) => log::warn!("Failed sending message to TCP stream (unknown IP); not sent."),
+                }
             }
         }
     }
