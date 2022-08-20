@@ -48,7 +48,7 @@ pub fn gen_iv() -> [u8; 32] {
 /// Converts slice in a string form to a real slice
 ///
 /// Example: `"[1,2,3,4]" -> [1,2,3,4]`
-pub fn parse_stringified_slice<'a>(msg: String) -> io::Result<Vec<u8>>
+pub fn parse_stringified_slice(msg: String) -> io::Result<Vec<u8>>
 {
     let mut msg_no_weird_chars = String::new();
 
@@ -112,7 +112,7 @@ pub fn init(port: u16, peer_addrs: HashSet<SocketAddr>, passphrase: &str) -> any
 }
 
 /// Starts the main thread for the server which listens to the given port.
-pub fn start_server<'a>(message_tx: Sender<Message>, peer_addrs: HashSet<IpAddr>, port: u16, passphrase: [u8; 32]) -> io::Result<()> {
+pub fn start_server(message_tx: Sender<Message>, peer_addrs: HashSet<IpAddr>, port: u16, passphrase: [u8; 32]) -> io::Result<()> {
     let listener = match TcpListener::bind(format!("0.0.0.0:{port}")) {
         Ok(listener) => listener,
         Err(_) => return Err(io::Error::new(io::ErrorKind::Other, "Failed listening to given port. Maybe the program doesn't have the required privileges or another program is already listening to that port?")),
