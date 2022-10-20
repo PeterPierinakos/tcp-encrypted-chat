@@ -203,8 +203,6 @@ pub fn start_server(
 
                 let data = data.as_str();
 
-                log::debug!("{}", data);
-
                 let recv_full_msg: Message = match serde_json::from_str(data) {
                     Ok(data) => data,
                     _ => {
