@@ -1,4 +1,3 @@
-use std::env;
 use rand::prelude::*;
 use std::net::IpAddr;
 use std::collections::HashSet;
@@ -78,13 +77,14 @@ pub fn parse_stringified_slice(msg: String) -> io::Result<Vec<u8>>
 
 /// The main application's function. it is responsible for handling the TCP listener, the incoming
 /// streams and the sending user's messages.
-pub fn init(port: u16, peer_addrs: HashSet<SocketAddr>, passphrase: &str) -> anyhow::Result<()> {
+pub fn init(port: u16, peer_addrs: HashSet<SocketAddr>, passphrase: Option<String>) -> anyhow::Result<()> {
     let (message_tx, message_rx): (Sender<Message>, Receiver<Message>) = mpsc::channel();
 
-    let mut passphrase_fixed: [u8; 32] = [0; 32];
+    let mut passphrase_fixed: Option<[u8; 32]> = None;
 
-    for (i, b) in passphrase.as_bytes().iter().enumerate() {
-        passphrase_fixed[i] = *b;
+    if let Some(passphrase) = passphrase {
+        passphrase_fixed = Some([0; 32]);
+        passphrase.as_bytes().iter().enumerate().for_each(|(i, b)| passphrase_fixed.unwrap()[i] = *b);
     }
 
     log::debug!("Fixed size passphrase: {:?}", passphrase_fixed);
@@ -93,13 +93,13 @@ pub fn init(port: u16, peer_addrs: HashSet<SocketAddr>, passphrase: &str) -> any
 
     thread::spawn(move || {
         start_shell(Vec::from_iter(peer_addrs), passphrase_fixed).map_err(|e| {
-            println!("{}", e);
+            eprintln!("{}", e);
             std::process::exit(1);
         }
     )});
     thread::spawn(move || {
         start_server(message_tx, peer_addr_ip_only, port, passphrase_fixed).map_err(|e| {
-            println!("{}", e);
+            eprintln!("{}", e);
             std::process::exit(1);
         })
     });
@@ -112,7 +112,7 @@ pub fn init(port: u16, peer_addrs: HashSet<SocketAddr>, passphrase: &str) -> any
 }
 
 /// Starts the main thread for the server which listens to the given port.
-pub fn start_server(message_tx: Sender<Message>, peer_addrs: HashSet<IpAddr>, port: u16, passphrase: [u8; 32]) -> io::Result<()> {
+pub fn start_server(message_tx: Sender<Message>, peer_addrs: HashSet<IpAddr>, port: u16, passphrase: Option<[u8; 32]>) -> io::Result<()> {
     let listener = match TcpListener::bind(format!("0.0.0.0:{port}")) {
         Ok(listener) => listener,
         Err(_) => return Err(io::Error::new(io::ErrorKind::Other, "Failed listening to given port. Maybe the program doesn't have the required privileges or another program is already listening to that port?")),
@@ -139,7 +139,11 @@ pub fn start_server(message_tx: Sender<Message>, peer_addrs: HashSet<IpAddr>, po
 
             let passphrase = passphrase_clone;
 
-            let cipher = Cipher::new_256(&passphrase);
+            let cipher = if let Some(passphrase) = passphrase {
+                Some(Cipher::new_256(&passphrase))
+            } else {
+                None
+            };
 
             let mut stream = stream;
 
@@ -183,79 +187,93 @@ pub fn start_server(message_tx: Sender<Message>, peer_addrs: HashSet<IpAddr>, po
                     }
                 };
 
-                // The first line is the IV and the rest is the message being sent
-                let data_split = data.to_string();
-                let data_split = data_split.split('\n').collect::<Vec<&str>>();
+                let mut final_msg = Message { peer: stream_peer_addr, message: String::new() };
 
-                // Treat the text before the newline as the IV and the rest as the ciphertext (as
-                // seen with the comments below)
-                let iv_buf = data_split[0];
+                if let Some(cipher) = &cipher {
+                    // The first line is the IV and the rest is the message being sent
+                    let data_split = data.to_string();
+                    let data_split = data_split.split('\n').collect::<Vec<&str>>();
 
-                let iv_utf8 = match std::str::from_utf8(iv_buf.trim().as_bytes()) {
-                    Ok(iv_utf8) => iv_utf8,
-                    Err(_) => {
-                        log::error!("Peer's IV doesn't contain valid UTF-8 data, not processing. ({stream_peer_addr})");
-                        continue;
-                    },
-                };
+                    // Treat the text before the newline as the IV and the rest as the ciphertext (as
+                    // seen with the comments below)
+                    let iv_buf = data_split[0];
 
-                let iv = match parse_stringified_slice(iv_utf8.to_string()) {
-                    Ok(iv) => iv,
-                    Err(_) => {
-                        log::error!("Peer's IV contains invalid data. ({stream_peer_addr})");
-                        continue;
-                    },
-                };
+                    let iv_utf8 = match std::str::from_utf8(iv_buf.trim().as_bytes()) {
+                        Ok(iv_utf8) => iv_utf8,
+                        Err(_) => {
+                            log::error!("Peer's IV doesn't contain valid UTF-8 data, not processing. ({stream_peer_addr})");
+                            continue;
+                        },
+                    };
 
-                log::debug!("Peer's IV: {iv:?} ({stream_peer_addr})");
+                    let iv = match parse_stringified_slice(iv_utf8.to_string()) {
+                        Ok(iv) => iv,
+                        Err(_) => {
+                            log::error!("Peer's IV contains invalid data. ({stream_peer_addr})");
+                            continue;
+                        },
+                    };
 
-                // If more than one newline was found (the first one is reserved for IV), then the
-                // rest which is the ciphertext to be sent will be joined together into a single
-                // string. This string may look something like this in some cases if extra newlines
-                // exist:
-                // [23,64,92,77][11,44,99]
-                let msg = data_split[1..].to_vec().iter().map(|item| *item).collect::<String>();
+                    log::debug!("Peer's IV: {iv:?} ({stream_peer_addr})");
 
-                // Parsed byte slice from all the messages
-                let parsed_msg = match parse_stringified_slice(msg.clone().to_string()) {
-                    Ok(msg) => msg,
-                    Err(e) => {
-                        log::error!("{}", e);
-                        continue;
-                    },
-                };
+                    // If more than one newline was found (the first one is reserved for IV), then the
+                    // rest which is the ciphertext to be sent will be joined together into a single
+                    // string. This string may look something like this in some cases if extra newlines
+                    // exist:
+                    // [23,64,92,77][11,44,99]
+                    let msg = data_split[1..].to_vec().iter().map(|item| *item).collect::<String>();
 
-                let msg_dec = cipher.cbc_decrypt(&iv, parsed_msg.as_slice());
+                    // Parsed byte slice from all the messages
+                    let parsed_msg = match parse_stringified_slice(msg.clone().to_string()) {
+                        Ok(msg) => msg,
+                        Err(e) => {
+                            log::error!("{}", e);
+                            continue;
+                        },
+                    };
 
-                let msg_plaintext = match std::string::String::from_utf8(msg_dec) {
-                    Ok(plaintext) => plaintext,
-                    Err(_) => {
-                        log::error!("Received message isn't valid UTF-8 data, not showing message.");
-                        continue;
-                    }
-                };
+                    let msg_dec = cipher.cbc_decrypt(&iv, parsed_msg.as_slice());
 
-                if !msg_plaintext.is_empty() {
-                    if message_tx.send(Message { peer: stream_peer_addr, message: msg_plaintext }).is_err() {
-                        log::warn!("Failed transmitting stream's message. ({stream_peer_addr})");
+                    let msg_plaintext = match std::string::String::from_utf8(msg_dec) {
+                        Ok(plaintext) => plaintext,
+                        Err(_) => {
+                            log::error!("Received message isn't valid UTF-8 data, not showing message.");
+                            continue;
+                        }
+                    };
+
+                    if !msg_plaintext.is_empty() {
+                        final_msg.message = msg_plaintext;
                     } else {
-                        log::debug!("Successfully transmitting client's message. ({stream_peer_addr})");
+                        log::warn!("Received empty message, skipping.");
+                        if stream.write(b"Message cannot be empty.").is_err() {
+                            log::warn!("Failed writing message rejection to TCP stream, skipping. ({stream_peer_addr})");
+                        }
+                        continue;
                     }
                 } else {
-                    log::error!("Received empty message, skipping.");
-                    if stream.write(b"Message cannot be empty.").is_err() {
-                        log::warn!("Failed writing message rejection to TCP stream, skipping. ({stream_peer_addr})");
+                    let data = data.trim();
+
+                    if data.len() > 0 {
+                        final_msg.message = data.trim().to_string();
+                    } else {
+                        log::warn!("Received empty message, skipping.");
                     }
                 }
-            }
 
+                if message_tx.send(final_msg).is_err() {
+                    log::warn!("Failed transmitting stream's message. ({stream_peer_addr})");
+                } else {
+                    log::debug!("Successfully transmitting client's message. ({stream_peer_addr})");
+                }
+            }
         });
     }
 
     Ok(())
 }
 
-pub fn start_shell(mut peer_addrs: Vec<SocketAddr>, passphrase: [u8; 32]) -> anyhow::Result<()> {
+pub fn start_shell(mut peer_addrs: Vec<SocketAddr>, passphrase: Option<[u8; 32]>) -> anyhow::Result<()> {
     let mut stdin = io::stdin().lock();
 
     log::debug!("Connecting to peer...");
@@ -278,7 +296,12 @@ pub fn start_shell(mut peer_addrs: Vec<SocketAddr>, passphrase: [u8; 32]) -> any
 
     log::info!("Connection successfully established with all peers.");
 
-    let cipher = Cipher::new_256(&passphrase);
+    let cipher = if let Some(passphrase) = passphrase {
+        Some(Cipher::new_256(&passphrase))
+    } else {
+        log::warn!("Connection is unencrypted, messages sent are plaintext.");
+        None
+    };
 
     loop {
         let mut msg_buf = String::new();
@@ -296,16 +319,20 @@ pub fn start_shell(mut peer_addrs: Vec<SocketAddr>, passphrase: [u8; 32]) -> any
         let iv_str = parse_vec_to_string(iv.to_vec());
         let iv_str = iv_str.as_str();
 
-        let encrypted_msg = cipher.cbc_encrypt(&iv, msg.as_bytes());
+        let final_msg =  if let Some(cipher) = &cipher {
+            let encrypted_msg = cipher.cbc_encrypt(&iv, msg.as_bytes());
 
-        log::debug!("Message encryption successful.");
+            log::debug!("Message encryption successful.");
 
-        let encrypted_msg_str = parse_vec_to_string(encrypted_msg);
+            let encrypted_msg_str = parse_vec_to_string(encrypted_msg);
 
-        let full_msg = [iv_str, "\n", encrypted_msg_str.as_str()].concat();
+            [iv_str, "\n", encrypted_msg_str.as_str()].concat()
+        } else {
+            msg.to_string()
+        };
 
         for stream in streams.iter_mut() {
-            if stream.write(full_msg.as_bytes()).is_err() {
+            if stream.write(final_msg.as_bytes()).is_err() {
                 match stream.peer_addr() {
                     Ok(peer_addr) => log::warn!("Failed sending message to TCP stream ({}); not sent.", peer_addr),
                     Err(_) => log::warn!("Failed sending message to TCP stream (unknown IP); not sent."),
@@ -313,29 +340,4 @@ pub fn start_shell(mut peer_addrs: Vec<SocketAddr>, passphrase: [u8; 32]) -> any
             }
         }
     }
-}
-
-/// Handles all arguments besides none. Returns true if the app should continue after the arguments
-/// are handled.
-pub fn handle_other_arguments(args: Vec<String>) -> bool {
-    let first_arg = args[1].clone();
-
-    match first_arg.as_str() {
-        "-v" | "--version" => println!("Version: {}", env::var("CARGO_PKG_VERSION").unwrap_or("could not detect Cargo version. Make sure you are running the program with the Rust's Cargo package manager.".to_string())),
-        "-h" | "--help" => println!(
-            "
--v or --version | Show program's version
--h or --help | Show this message
---with-logs | Run the program with env_logger initialized (outputs all logs to stdout)
-            "
-        ),
-        "--with-logs" => {
-            env::set_var("RUST_LOG", "debug");
-            env_logger::init();
-            return true;
-        }
-        _ => println!("Invalid first argument provided."),
-    }
-
-    false
 }

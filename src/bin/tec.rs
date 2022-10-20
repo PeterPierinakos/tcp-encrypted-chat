@@ -1,81 +1,38 @@
-use std::io::{self, BufRead, Write};
 use std::collections::HashSet;
 use std::net::SocketAddr;
-use std::str::FromStr;
 use tec::app;
+use clap::Parser;
+use std::process::ExitCode;
 
-fn handle_input() -> anyhow::Result<()> {
-    println!("Enter port the server should listen to for incoming TCP streams");
-    print!("> ");
-
-    io::stdout().flush()?;
-    let mut stdin = io::stdin().lock();
-    let mut buffer_port = String::new();
-    stdin.read_line(&mut buffer_port)?;
-    let port = match buffer_port.trim().parse::<u16>() {
-        Ok(port) => port,
-        Err(_) => {
-            return Err(anyhow::Error::new(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "Invalid port given. The port can be 1 - 65535.",
-            )))
-        }
-    };
-
-    println!("Enter peer socket addresses (separate with commas if more than one)");
-    print!("> ");
-    io::stdout().flush()?;
-    let mut buffer_addr = String::new();
-    stdin.read_line(&mut buffer_addr)?;
-
-    let iter_addrs = buffer_addr.trim().split(",");
-
-    let mut peer_addrs = HashSet::new();
-
-    for addr in iter_addrs {
-        let peer_addr = match SocketAddr::from_str(addr) {
-            Ok(peer_addr) => peer_addr,
-            Err(_) => return Err(anyhow::Error::new(io::Error::new(io::ErrorKind::InvalidData, format!("Invalid socket address given ({addr}). Example of a valid socket address: \"127.0.0.1:5542\".")))),
-        };
-        peer_addrs.insert(peer_addr);
-    };
-
-    println!("Enter encryption / decryption passphrase (must be exactly 32 characters long) (peer has to use the same one)");
-    print!("> ");
-    io::stdout().flush()?;
-    let mut buffer_passphrase = String::new();
-    stdin.read_line(&mut buffer_passphrase)?;
-
-    let passphrase = buffer_passphrase.trim();
-
-    if passphrase.len() != 32 {
-        return Err(anyhow::Error::new(io::Error::new(io::ErrorKind::InvalidData, "Passphrase's length isn't 32.")));
-    }
-
-    drop(stdin);
-
-    log::info!("Input is OK, starting server...");
-    app::init(port, peer_addrs, passphrase)?;
-
-    Ok(())
+#[derive(Parser, Debug)]
+pub struct Args {
+    #[arg(short, long)]
+    /// Enables logs for env_logger; logs information for debugging
+    pub with_logs: bool,
+    // TODO: implement proxy functionality
+    /// Used to specify whether you are establishing a connection with a specific peer (proxy) which will send all of the data received from the peers connected to it and will allow you to send messages as it
+    #[arg(short, long)]
+    pub using_proxy: bool,
+    #[arg(long, required(true))]
+    pub port: u16,
+    #[arg(long, required(true))]
+    /// Adds a peer socket address to the peers the client will connect to at runtime. There can be multiple peers.
+    pub peer_addr: Vec<SocketAddr>,
+    #[arg(long)]
+    pub passphrase: Option<String>,
 }
 
-fn main() -> anyhow::Result<()> {
-    println!("TEC - TCP Encrypted Chat");
-    println!();
+fn main() -> anyhow::Result<ExitCode> {
+    let args = Args::parse();
 
-    let args = std::env::args().collect::<Vec<String>>();
+    println!("TEC - TCP Encrypted Chat\n");
 
-    match args.len() {
-        1 => {
-            handle_input()?;
-        }
-        _ => {
-            if app::handle_other_arguments(args) {
-                handle_input()?;
-            }
-        }
+    if args.with_logs {
+        std::env::set_var("RUST_LOG", "info");
+        env_logger::init();
     }
 
-    Ok(())
+    app::init(args.port, args.peer_addr.iter().map(|addr| *addr).collect::<HashSet<SocketAddr>>(), args.passphrase)?;
+
+    Ok(ExitCode::from(0))
 }
