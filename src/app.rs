@@ -11,13 +11,6 @@ use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
 use std::time::Duration;
 
-#[derive(Debug, Clone, PartialEq)]
-pub enum ProxyMode {
-    Hosting,
-    Using,
-    None,
-}
-
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 pub enum ValidMessage {
     Encrypted(Vec<u8>),
@@ -28,7 +21,6 @@ pub enum ValidMessage {
 #[derive(Deserialize, Serialize, Debug)]
 pub struct Message {
     pub iv: Option<[u8; 32]>,
-    pub message_is_from_proxy: bool,
     pub message: ValidMessage,
 }
 
@@ -58,7 +50,6 @@ pub fn init(
     port: u16,
     peer_addrs: HashSet<SocketAddr>,
     passphrase: Option<String>,
-    proxy_mode: ProxyMode,
 ) -> anyhow::Result<()> {
     let (message_tx, message_rx): (Sender<FinalMessage>, Receiver<FinalMessage>) = mpsc::channel();
 
@@ -81,7 +72,7 @@ pub fn init(
         .collect::<HashSet<IpAddr>>();
 
     thread::spawn(move || {
-        start_shell(Vec::from_iter(peer_addrs), passphrase_fixed, proxy_mode).map_err(|e| {
+        start_shell(Vec::from_iter(peer_addrs), passphrase_fixed).map_err(|e| {
             eprintln!("{}", e);
             std::process::exit(1);
         })
@@ -290,7 +281,6 @@ pub fn start_server(
 pub fn start_shell(
     mut peer_addrs: Vec<SocketAddr>,
     passphrase: Option<[u8; 32]>,
-    proxy_mode: ProxyMode,
 ) -> anyhow::Result<()> {
     let mut stdin = io::stdin().lock();
 
@@ -331,12 +321,6 @@ pub fn start_shell(
             continue;
         }
 
-        let message_is_from_proxy = if proxy_mode == ProxyMode::Using {
-            true
-        } else {
-            false
-        };
-
         let final_msg = if let Some(cipher) = &cipher {
             let iv = gen_iv();
             log::debug!("Your generated IV: {:?}", iv);
@@ -348,7 +332,6 @@ pub fn start_shell(
             let msg_con = Message {
                 iv: Some(iv),
                 message: ValidMessage::Encrypted(encrypted_msg),
-                message_is_from_proxy,
             };
 
             match serde_json::to_string(&msg_con) {
@@ -362,7 +345,6 @@ pub fn start_shell(
             let msg_con = Message {
                 message: ValidMessage::Plaintext(msg.to_string()),
                 iv: None,
-                message_is_from_proxy,
             };
 
             match serde_json::to_string(&msg_con) {

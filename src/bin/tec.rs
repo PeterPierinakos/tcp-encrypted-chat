@@ -2,7 +2,7 @@ use clap::Parser;
 use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::process::exit;
-use tec::app::{self, ProxyMode};
+use tec::app;
 
 #[derive(Parser, Debug)]
 pub struct Args {
@@ -12,8 +12,6 @@ pub struct Args {
     /// Enables DEBUG logs for env_logger
     #[arg(short, long)]
     pub debug_mode: bool,
-    #[arg(default_value = "none")]
-    pub proxy_mode: String,
     #[arg(long, required(true))]
     pub port: u16,
     #[arg(long, required(true))]
@@ -53,16 +51,6 @@ fn main() -> anyhow::Result<()> {
         }
     }
 
-    let proxy_mode = match args.proxy_mode.as_str() {
-        "host" => ProxyMode::Hosting,
-        "use" => ProxyMode::Using,
-        "none" => ProxyMode::None,
-        _ => {
-            eprintln!("Invalid value provided to 'proxy_mode'.");
-            exit(1)
-        }
-    };
-
     app::init(
         args.port,
         args.peer_addr
@@ -70,6 +58,5 @@ fn main() -> anyhow::Result<()> {
             .map(|addr| *addr)
             .collect::<HashSet<SocketAddr>>(),
         args.passphrase,
-        proxy_mode,
     )
 }
